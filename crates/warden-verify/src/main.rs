@@ -75,12 +75,14 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 
 fn hex32(s: &str, what: &str) -> Result<[u8; 32], String> {
     let v = hex::decode(s).map_err(|e| format!("{what}: bad hex: {e}"))?;
-    v.try_into().map_err(|_| format!("{what}: expected 32 bytes"))
+    v.try_into()
+        .map_err(|_| format!("{what}: expected 32 bytes"))
 }
 
 fn hex64(s: &str, what: &str) -> Result<[u8; 64], String> {
     let v = hex::decode(s).map_err(|e| format!("{what}: bad hex: {e}"))?;
-    v.try_into().map_err(|_| format!("{what}: expected 64 bytes"))
+    v.try_into()
+        .map_err(|_| format!("{what}: expected 64 bytes"))
 }
 
 /// Byte-for-byte the same encoding used to build and sign entries.
@@ -132,7 +134,11 @@ fn run(bundle_dir: &Path) -> Result<(), Vec<String>> {
     };
     let verifying_key = match VerifyingKey::from_bytes(&pubkey_bytes) {
         Ok(k) => k,
-        Err(e) => return Err(vec![format!("regulator_pubkey is not a valid Ed25519 key: {e}")]),
+        Err(e) => {
+            return Err(vec![format!(
+                "regulator_pubkey is not a valid Ed25519 key: {e}"
+            )])
+        }
     };
 
     // ledger_id is a UUID string in the manifest; warden-core hashes its
@@ -154,19 +160,31 @@ fn run(bundle_dir: &Path) -> Result<(), Vec<String>> {
 
         let prev_hash = match hex32(&entry.prev_hash, &label) {
             Ok(v) => v,
-            Err(e) => { errors.push(e); continue; }
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
         };
         let payload_hash_declared = match hex32(&entry.payload_hash, &label) {
             Ok(v) => v,
-            Err(e) => { errors.push(e); continue; }
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
         };
         let entry_hash_declared = match hex32(&entry.entry_hash, &label) {
             Ok(v) => v,
-            Err(e) => { errors.push(e); continue; }
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
         };
         let sig_bytes = match hex64(&entry.signature, &label) {
             Ok(v) => v,
-            Err(e) => { errors.push(e); continue; }
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
         };
 
         // Rule 4a: chain linkage.
@@ -177,7 +195,11 @@ fn run(bundle_dir: &Path) -> Result<(), Vec<String>> {
         if prev_hash != expected_prev {
             errors.push(format!(
                 "{label}: prev_hash does not match {} — chain is broken or spliced",
-                if prev_entry_hash.is_none() { "genesis" } else { "preceding entry" }
+                if prev_entry_hash.is_none() {
+                    "genesis"
+                } else {
+                    "preceding entry"
+                }
             ));
         }
 
@@ -189,7 +211,8 @@ fn run(bundle_dir: &Path) -> Result<(), Vec<String>> {
                     if bytes.len() as u64 != entry.payload_len {
                         errors.push(format!(
                             "{label}: payload_len mismatch (manifest says {}, file is {} bytes)",
-                            entry.payload_len, bytes.len()
+                            entry.payload_len,
+                            bytes.len()
                         ));
                     }
                     let actual = sha256(&bytes);

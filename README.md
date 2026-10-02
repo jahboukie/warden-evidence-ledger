@@ -61,6 +61,20 @@ cargo build --release --workspace
 ./target/release/warden anchor --dir ./ledger --type manual \
     --proof "root hash posted to <public URL> at <time>"
 
+# Or ask an RFC 3161 timestamp authority to sign the current root hash.
+# Any public TSA works; RSA and ECDSA over P-256/P-384/P-521 are supported.
+./target/release/warden anchor --dir ./ledger --type rfc3161 \
+    --tsa-url https://freetsa.org/tsr
+
+# Pin the TSA certificate (PEM or DER) so the token must come from that key:
+./target/release/warden anchor --dir ./ledger --type rfc3161 \
+    --tsa-url https://freetsa.org/tsr --tsa-cert ./tsa-cert.pem
+
+# Or hand it a token you already have (no network): it is re-verified
+# against this ledger's current root before it is recorded.
+./target/release/warden anchor --dir ./ledger --type rfc3161 \
+    --proof '<base64 TimeStampToken>'
+
 # Check status any time. (This also warns you if a private key file is
 # sitting inside the bundle — it must never travel with the evidence.)
 ./target/release/warden info --dir ./ledger
@@ -75,6 +89,21 @@ cargo build --release --workspace
 > anyone who receives the bundle can forge regulator signatures and the
 > whole trust model collapses. Keep the key in separate storage —
 > ideally offline or in a different custody system than the evidence.
+
+### What an RFC 3161 anchor proves
+
+Every token — fetched with `--tsa-url` or supplied with `--proof` — is
+verified locally before it is recorded: the `messageImprint` must be
+SHA-256 over *this* ledger's current root hash (hashed as the raw 32
+bytes, not the hex text `warden info` prints), the CMS signature must
+verify against the certificate embedded in the token, that certificate
+must have been valid at `genTime`, and the echoed nonce must match the
+request we sent (when we sent it). With `--tsa-cert` the signer's public
+key must additionally equal the pin. Without a pin, verification only
+proves the token is internally consistent — anyone can mint such a token
+with their own key — so pin the certificate, or at least check the
+printed TSA subject. The full list of checks lives in the module docs of
+`crates/warden-cli/src/tsa.rs`.
 
 ## What "unbreakable" actually means here
 

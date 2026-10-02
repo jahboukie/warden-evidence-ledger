@@ -15,13 +15,15 @@
 //! `warden-verify ./ledger`, a separate, deliberately tiny binary that
 //! does not depend on this crate.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use warden_core::{Anchor, AnchorType, Ledger, Manifest};
+
+mod tsa;
 
 #[derive(Parser)]
 #[command(name = "warden", about = "Independent, regulator-held evidence ledger")]
@@ -63,11 +65,19 @@ enum Command {
         dir: PathBuf,
         #[arg(long, value_enum)]
         r#type: AnchorTypeArg,
-        /// The proof text: an RFC 3161 token (base64), a Rekor entry UUID,
-        /// or a free-text description of where/how you published the root
-        /// hash for a manual anchor.
+        /// The proof: a base64 RFC 3161 token (verified against this
+        /// ledger's current root before it is recorded), a Rekor entry
+        /// reference, or free text describing a manual publication.
         #[arg(long)]
-        proof: String,
+        proof: Option<String>,
+        /// RFC 3161 timestamp authority to ask when --proof is omitted
+        /// (e.g. https://freetsa.org/tsr). Only for --type rfc3161.
+        #[arg(long)]
+        tsa_url: Option<String>,
+        /// TSA certificate (PEM or DER) to pin: the token's signer must
+        /// carry this exact public key. Only for --type rfc3161.
+        #[arg(long)]
+        tsa_cert: Option<PathBuf>,
     },
     /// Re-verify the ledger in place (same checks warden-verify runs on
     /// an exported bundle) and print a summary.
@@ -95,8 +105,8 @@ impl From<AnchorTypeArg> for AnchorType {
 }
 
 fn load_key(path: &Path) -> Result<SigningKey> {
-    let hex_str = fs::read_to_string(path)
-        .with_context(|| format!("reading key file {}", path.display()))?;
+    let hex_str =
+        fs::read_to_string(path).with_context(|| format!("reading key file {}", path.display()))?;
     let bytes = hex::decode(hex_str.trim()).context("key file is not valid hex")?;
     let arr: [u8; 32] = bytes
         .try_into()
@@ -124,8 +134,19 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Keygen { key } => cmd_keygen(&key),
         Command::Init { dir, key } => cmd_init(&dir, &key),
-        Command::Ingest { dir, key, file, label } => cmd_ingest(&dir, &key, file.as_deref(), label),
-        Command::Anchor { dir, r#type, proof } => cmd_anchor(&dir, r#type.into(), proof),
+        Command::Ingest {
+            dir,
+            key,
+            file,
+            label,
+        } => cmd_ingest(&dir, &key, file.as_deref(), label),
+        Command::Anchor {
+            dir,
+            r#type,
+            proof,
+            tsa_url,
+            tsa_cert,
+        } => cmd_anchor(&dir, r#type.into(), proof, tsa_url, tsa_cert),
         Command::Info { dir } => cmd_info(&dir),
     }
 }
@@ -154,7 +175,10 @@ fn cmd_keygen(key_path: &Path) -> Result<()> {
 
 fn cmd_init(dir: &Path, key_path: &Path) -> Result<()> {
     if dir.join("manifest.json").exists() {
-        bail!("{} already has a manifest.json — ledger already initialized", dir.display());
+        bail!(
+            "{} already has a manifest.json — ledger already initialized",
+            dir.display()
+        );
     }
     let signing_key = load_key(key_path)?;
     let ledger = Ledger::new(signing_key);
@@ -167,7 +191,12 @@ fn cmd_init(dir: &Path, key_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ingest(dir: &Path, key_path: &Path, file: Option<&Path>, label: Option<String>) -> Result<()> {
+fn cmd_ingest(
+    dir: &Path,
+    key_path: &Path,
+    file: Option<&Path>,
+    label: Option<String>,
+) -> Result<()> {
     let signing_key = load_key(key_path)?;
     let manifest = warden_core::read_manifest(dir).context("loading existing ledger")?;
     let mut ledger = Ledger::from_manifest(manifest, Some(signing_key))
@@ -193,17 +222,33 @@ fn cmd_ingest(dir: &Path, key_path: &Path, file: Option<&Path>, label: Option<St
 
     let entry = ledger.append(&payload, Some(payload_ref), label)?.clone();
 
-    ledger.verify_chain().context("post-append self-check failed — refusing to persist")?;
+    ledger
+        .verify_chain()
+        .context("post-append self-check failed — refusing to persist")?;
 
     let manifest = ledger.to_manifest();
     warden_core::write_manifest(dir, &manifest)?;
 
-    println!("appended entry seq={} entry_hash={}", entry.seq, hex::encode(entry.entry_hash));
+    println!(
+        "appended entry seq={} entry_hash={}",
+        entry.seq,
+        hex::encode(entry.entry_hash)
+    );
     println!("ledger now has {} entries", ledger.entries.len());
     Ok(())
 }
 
-fn cmd_anchor(dir: &Path, anchor_type: AnchorType, proof: String) -> Result<()> {
+fn cmd_anchor(
+    dir: &Path,
+    anchor_type: AnchorType,
+    proof: Option<String>,
+    tsa_url: Option<String>,
+    tsa_cert: Option<PathBuf>,
+) -> Result<()> {
+    if anchor_type != AnchorType::Rfc3161 && (tsa_url.is_some() || tsa_cert.is_some()) {
+        bail!("--tsa-url and --tsa-cert only apply to --type rfc3161");
+    }
+
     let manifest = warden_core::read_manifest(dir)?;
     let ledger = Ledger::from_manifest(manifest, None)?;
     let up_to_seq = match ledger.entries.last() {
@@ -212,12 +257,38 @@ fn cmd_anchor(dir: &Path, anchor_type: AnchorType, proof: String) -> Result<()> 
     };
     let root_hash = ledger.current_root().unwrap();
 
+    let pinned = match &tsa_cert {
+        Some(path) => Some(tsa::load_pinned_spki(path)?),
+        None => None,
+    };
+
+    let proof = match anchor_type {
+        AnchorType::Rfc3161 => match proof {
+            Some(text) => {
+                let token = tsa::decode_token(&text)
+                    .context("--proof is not a valid base64 TimeStampToken")?;
+                let verified = tsa::verify_token(&token, &root_hash, None, pinned.as_deref())?;
+                print_timestamp(&verified);
+                text
+            }
+            None => {
+                let url = tsa_url.as_deref().ok_or_else(|| {
+                    anyhow!("--type rfc3161 needs either --tsa-url <url> (ask a TSA now) or --proof <base64 token>")
+                })?;
+                let (token, verified) = tsa::timestamp_root(url, &root_hash, pinned.as_deref())?;
+                print_timestamp(&verified);
+                tsa::encode_token(&token)
+            }
+        },
+        _ => proof.ok_or_else(|| anyhow!("--proof is required for this anchor type"))?,
+    };
+
     let mut ledger = ledger;
     ledger.add_anchor(Anchor {
         up_to_seq,
         root_hash,
         anchor_type,
-        proof,
+        proof: proof.clone(),
         anchored_at_unix: chrono::Utc::now().timestamp(),
     });
     let manifest = ledger.to_manifest();
@@ -227,8 +298,23 @@ fn cmd_anchor(dir: &Path, anchor_type: AnchorType, proof: String) -> Result<()> 
         up_to_seq,
         hex::encode(root_hash)
     );
-    println!("(this root_hash is what you should have submitted to your external timestamp authority / transparency log)");
+    if anchor_type == AnchorType::Rfc3161 {
+        println!(
+            "stored a {}-byte base64 RFC 3161 token as this anchor's proof",
+            proof.len()
+        );
+    } else {
+        println!("(this root_hash is what you should have submitted to your external timestamp authority / transparency log)");
+    }
     Ok(())
+}
+
+fn print_timestamp(verified: &tsa::VerifiedTimestamp) {
+    println!("RFC 3161 timestamp verified against this ledger's root hash:");
+    println!("  {:<13} {}", "policy:", verified.policy);
+    println!("  {:<13} {}", "genTime:", verified.gen_time);
+    println!("  {:<13} {}", "tsa subject:", verified.tsa_subject);
+    println!("  {:<13} {}", "tsa serial:", verified.serial_hex);
 }
 
 fn cmd_info(dir: &Path) -> Result<()> {

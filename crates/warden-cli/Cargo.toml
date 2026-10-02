@@ -14,6 +14,21 @@ hex = "0.4"
 anyhow = "1"
 chrono = "0.4"
 
+# RFC 3161 timestamping (`warden anchor --type rfc3161 --tsa-url ...`)
+sha2 = { version = "0.10", features = ["oid"] }
+base64 = "0.23"
+ureq = "3"
+der = { version = "0.7", features = ["alloc", "derive", "oid", "pem", "std"] }
+cms = "0.2"
+x509-cert = { version = "0.2", features = ["pem", "std"] }
+spki = { version = "0.7", features = ["alloc", "std"] }
+const-oid = { version = "0.9", features = ["db"] }
+rsa = "0.9"
+signature = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.13", features = ["ecdsa"] }
+
 [[bin]]
 name = "warden"
 path = "src/main.rs"

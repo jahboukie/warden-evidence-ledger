@@ -243,11 +243,7 @@ impl Ledger {
                 return Err(WardenError::HashMismatch { seq: entry.seq });
             }
             let sig = Signature::from_bytes(&entry.signature);
-            if self
-                .regulator_pubkey
-                .verify(&cbytes, &sig)
-                .is_err()
-            {
+            if self.regulator_pubkey.verify(&cbytes, &sig).is_err() {
                 return Err(WardenError::BadSignature { seq: entry.seq });
             }
         }
@@ -370,9 +366,15 @@ mod tests {
     #[test]
     fn chain_of_three_verifies() {
         let (mut ledger, _sk) = Ledger::new_with_generated_key();
-        ledger.append(b"first payload", None, Some("req 1".into())).unwrap();
-        ledger.append(b"second payload", None, Some("req 2".into())).unwrap();
-        ledger.append(b"third payload", None, Some("req 3".into())).unwrap();
+        ledger
+            .append(b"first payload", None, Some("req 1".into()))
+            .unwrap();
+        ledger
+            .append(b"second payload", None, Some("req 2".into()))
+            .unwrap();
+        ledger
+            .append(b"third payload", None, Some("req 3".into()))
+            .unwrap();
         assert_eq!(ledger.entries.len(), 3);
         ledger.verify_chain().unwrap();
     }
