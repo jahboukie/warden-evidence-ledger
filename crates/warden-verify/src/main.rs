@@ -17,9 +17,12 @@
 //!      (regulator_pubkey, ledger_id) — so entries cannot be spliced in
 //!      from a different ledger or a different key.
 //!   5. If anchors are present, that each anchor's root_hash matches the
-//!      entry_hash of the entry at its up_to_seq (anchor proof content
-//!      itself, e.g. an RFC 3161 token, is printed for manual/external
-//!      verification — this tool does not call out to a TSA).
+//!      entry_hash of the entry at its up_to_seq.
+//!   6. For RFC 3161 anchors, that the stored token's `messageImprint` is
+//!      SHA-256 of that root — so the token really does timestamp this
+//!      bundle (the token's own signature is NOT checked here: verifying
+//!      CMS certificates is beyond this file's intended scope, and
+//!      `warden info` already does it; nothing here makes a network call).
 //!
 //! Usage: warden-verify <bundle-dir>
 //! Exit code 0 = every check passed. Non-zero = at least one failed;
@@ -258,24 +261,39 @@ fn run(bundle_dir: &Path) -> Result<(), Vec<String>> {
     // Rule 5: anchors, if present, reference a real entry hash.
     for anchor in &manifest.anchors {
         let entry = manifest.entries.iter().find(|e| e.seq == anchor.up_to_seq);
-        match entry {
-            None => errors.push(format!(
+        let Some(entry) = entry else {
+            errors.push(format!(
                 "anchor for seq {} references an entry that does not exist in this bundle",
                 anchor.up_to_seq
+            ));
+            continue;
+        };
+        if entry.entry_hash.to_lowercase() != anchor.root_hash.to_lowercase() {
+            errors.push(format!(
+                "anchor for seq {} has root_hash that does not match that entry's entry_hash",
+                anchor.up_to_seq
+            ));
+            continue;
+        }
+
+        if anchor.anchor_type != "Rfc3161" {
+            eprintln!(
+                "  [info] anchor up to seq {}: type={}, proof={} — verify this proof independently against its external authority",
+                anchor.up_to_seq, anchor.anchor_type, anchor.proof
+            );
+            continue;
+        }
+
+        // Rule 6: an RFC 3161 token must actually timestamp this root.
+        match rfc3161_report(&anchor.proof, &anchor.root_hash) {
+            Ok(gen_time) => eprintln!(
+                "  [ok] anchor up to seq {}: RFC 3161 token commits to this root (genTime={gen_time}; signature not checked here — run `warden info` for that)",
+                anchor.up_to_seq
+            ),
+            Err(e) => errors.push(format!(
+                "anchor for seq {}: RFC 3161 token does not check out: {e}",
+                anchor.up_to_seq
             )),
-            Some(entry) => {
-                if entry.entry_hash.to_lowercase() != anchor.root_hash.to_lowercase() {
-                    errors.push(format!(
-                        "anchor for seq {} has root_hash that does not match that entry's entry_hash",
-                        anchor.up_to_seq
-                    ));
-                } else {
-                    eprintln!(
-                        "  [info] anchor up to seq {}: type={}, proof={} — verify this proof independently against its external authority",
-                        anchor.up_to_seq, anchor.anchor_type, anchor.proof
-                    );
-                }
-            }
         }
     }
 
@@ -294,6 +312,239 @@ fn parse_uuid(s: &str) -> Result<Vec<u8>, String> {
         return Err(format!("ledger_id is not a valid UUID: {s}"));
     }
     hex::decode(&cleaned).map_err(|e| format!("ledger_id is not valid hex: {e}"))
+}
+
+/// Standard base64 (RFC 4648) with padding, hand-rolled the same way
+/// `parse_uuid` is: this verifier stays free of dependencies it doesn't
+/// need to re-implement a rule.
+fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
+    fn sextet(c: u8) -> Result<u8, String> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            other => Err(format!("invalid base64 character {:?}", other as char)),
+        }
+    }
+
+    let text: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if !text.len().is_multiple_of(4) {
+        return Err("base64 length is not a multiple of 4".into());
+    }
+    let bytes = text.as_bytes();
+    let pad = if text.ends_with("==") {
+        2
+    } else if text.ends_with('=') {
+        1
+    } else {
+        0
+    };
+    let data_len = bytes.len() - pad;
+    if data_len % 4 == 1 {
+        return Err("base64 has a single leftover character".into());
+    }
+
+    let mut out = Vec::with_capacity(data_len * 3 / 4 + 2);
+    let mut i = 0;
+    while i < data_len {
+        let remaining = data_len - i;
+        let a = sextet(bytes[i])?;
+        let b = sextet(bytes[i + 1])?;
+        out.push((a << 2) | (b >> 4));
+        if remaining == 2 {
+            break;
+        }
+        let c = sextet(bytes[i + 2])?;
+        out.push((b << 4) | (c >> 2));
+        if remaining == 3 {
+            break;
+        }
+        let d = sextet(bytes[i + 3])?;
+        out.push((c << 6) | d);
+        i += 4;
+    }
+    Ok(out)
+}
+
+/// DER contents of `id-ct-TSTInfo` (1.2.840.113549.1.9.16.1.4) and
+/// `id-sha256` (2.16.840.1.101.3.4.2.1), without their tag/length bytes.
+const OID_TST_INFO: &[u8] = &[
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x04,
+];
+const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+
+/// One DER tag/length/value triple, borrowed from its input slice.
+struct Tlv<'a> {
+    tag: u8,
+    value: &'a [u8],
+}
+
+/// Read one TLV at `offset`, returning it plus the offset just past it.
+fn tlv_at<'a>(data: &'a [u8], offset: usize, what: &str) -> Result<(Tlv<'a>, usize), String> {
+    if offset >= data.len() {
+        return Err(format!("{what}: truncated"));
+    }
+    let tag = data[offset];
+    let mut i = offset + 1;
+    if tag & 0x1f == 0x1f {
+        while i < data.len() && data[i] & 0x80 != 0 {
+            i += 1;
+        }
+        if i >= data.len() {
+            return Err(format!("{what}: truncated tag"));
+        }
+        i += 1;
+    }
+    if i >= data.len() {
+        return Err(format!("{what}: truncated length"));
+    }
+    let first_len = data[i];
+    i += 1;
+    let len = if first_len & 0x80 == 0 {
+        first_len as usize
+    } else {
+        let n = (first_len & 0x7f) as usize;
+        if n == 0 || n > 4 {
+            return Err(format!("{what}: implausible length encoding"));
+        }
+        if i + n > data.len() {
+            return Err(format!("{what}: truncated length"));
+        }
+        let mut l = 0usize;
+        for _ in 0..n {
+            l = (l << 8) | data[i] as usize;
+            i += 1;
+        }
+        l
+    };
+    if i + len > data.len() {
+        return Err(format!("{what}: value runs past the end of the data"));
+    }
+    Ok((
+        Tlv {
+            tag,
+            value: &data[i..i + len],
+        },
+        i + len,
+    ))
+}
+
+/// Split the contents of a DER SEQUENCE into its members.
+fn tlv_children<'a>(data: &'a [u8], what: &str) -> Result<Vec<Tlv<'a>>, String> {
+    let mut members = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let (member, next) = tlv_at(data, offset, what)?;
+        members.push(member);
+        offset = next;
+    }
+    Ok(members)
+}
+
+/// Pull `genTime` and the `messageImprint` out of a base64 RFC 3161
+/// TimeStampToken, walking only the DER fields needed for Rule 6:
+/// ContentInfo -> SignedData -> encapContentInfo -> TSTInfo.
+fn token_imprint(proof_b64: &str) -> Result<(String, [u8; 32]), String> {
+    let der = decode_base64(proof_b64)?;
+
+    let (content_info, _) = tlv_at(&der, 0, "ContentInfo")?;
+    if content_info.tag != 0x30 {
+        return Err("token is not a DER SEQUENCE".into());
+    }
+    let ci_members = tlv_children(content_info.value, "ContentInfo")?;
+
+    let signed = ci_members
+        .iter()
+        .find(|t| t.tag == 0xa0)
+        .ok_or_else(|| "token carries no SignedData".to_string())?;
+    let (signed_data, _) = tlv_at(signed.value, 0, "SignedData")?;
+    let sd_members = tlv_children(signed_data.value, "SignedData")?;
+
+    // encapContentInfo is the SEQUENCE whose first member is id-ct-TSTInfo.
+    let mut encap_members = None;
+    for member in sd_members.iter().filter(|t| t.tag == 0x30) {
+        let members = tlv_children(member.value, "encapContentInfo")?;
+        if matches!(
+            members.first(),
+            Some(m) if m.tag == 0x06 && m.value == OID_TST_INFO
+        ) {
+            encap_members = Some(members);
+            break;
+        }
+    }
+    let encap_members =
+        encap_members.ok_or_else(|| "token's eContent is not id-ct-TSTInfo".to_string())?;
+
+    let econtent = encap_members
+        .iter()
+        .find(|t| t.tag == 0xa0)
+        .ok_or_else(|| "token's eContent is missing".to_string())?;
+    let (octet, _) = tlv_at(econtent.value, 0, "eContent")?;
+    if octet.tag != 0x04 {
+        return Err("token's eContent is not an OCTET STRING".into());
+    }
+
+    // TSTInfo: version, policy, messageImprint, serial, genTime, ...
+    let (tst_info, _) = tlv_at(octet.value, 0, "TSTInfo")?;
+    if tst_info.tag != 0x30 {
+        return Err("token's eContent does not hold a TSTInfo SEQUENCE".into());
+    }
+    let tst = tlv_children(tst_info.value, "TSTInfo")?;
+    let imprint_seq = tst
+        .iter()
+        .find(|t| t.tag == 0x30)
+        .ok_or_else(|| "TSTInfo has no messageImprint".to_string())?;
+    let gen_time = tst
+        .iter()
+        .find(|t| t.tag == 0x18)
+        .ok_or_else(|| "TSTInfo has no genTime".to_string())?;
+
+    let imprint_members = tlv_children(imprint_seq.value, "messageImprint")?;
+    let hash_alg = imprint_members
+        .first()
+        .filter(|t| t.tag == 0x30)
+        .ok_or_else(|| "messageImprint has no hash algorithm".to_string())?;
+    let alg_members = tlv_children(hash_alg.value, "hashAlgorithm")?;
+    let oid = alg_members
+        .first()
+        .filter(|t| t.tag == 0x06)
+        .ok_or_else(|| "hash algorithm has no OID".to_string())?;
+    if oid.value != OID_SHA256 {
+        return Err("messageImprint does not use SHA-256".into());
+    }
+    let hashed = imprint_members
+        .get(1)
+        .filter(|t| t.tag == 0x04)
+        .ok_or_else(|| "messageImprint has no hashedMessage".to_string())?;
+    if hashed.value.len() != 32 {
+        return Err(format!(
+            "messageImprint is {} bytes, expected 32",
+            hashed.value.len()
+        ));
+    }
+    let mut imprint = [0u8; 32];
+    imprint.copy_from_slice(hashed.value);
+
+    Ok((
+        String::from_utf8_lossy(gen_time.value).into_owned(),
+        imprint,
+    ))
+}
+
+/// Rule 6: the stored RFC 3161 token must timestamp this bundle's root.
+/// Returns the token's `genTime` when it does.
+fn rfc3161_report(proof_b64: &str, root_hash_hex: &str) -> Result<String, String> {
+    let root = hex32(root_hash_hex, "anchor root_hash")?;
+    let (gen_time, imprint) = token_imprint(proof_b64)?;
+    if imprint != sha256(&root) {
+        return Err(
+            "messageImprint is not SHA-256 of this bundle's root — it timestamps a different value"
+                .into(),
+        );
+    }
+    Ok(gen_time)
 }
 
 fn main() -> ExitCode {
@@ -317,5 +568,47 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real freetsa.org token, captured from `warden anchor --type rfc3161`.
+    const PROOF: &str = include_str!("../tests/fixtures/rfc3161-proof.b64");
+    const ROOT_HEX: &str = "cfd7e9e720f040bf65c8799157309aae3c2e7491b4e3ce31bac001276eb6cb70";
+
+    #[test]
+    fn base64_decoder_handles_padding_and_remainders() {
+        assert_eq!(decode_base64("").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_base64("TQ==").unwrap(), b"M");
+        assert_eq!(decode_base64("TWE=").unwrap(), b"Ma");
+        assert_eq!(decode_base64("SGVsbG8=").unwrap(), b"Hello");
+        assert!(decode_base64("TQ=").is_err());
+        assert!(decode_base64("QQ=#").is_err());
+        assert!(decode_base64("A===").is_err());
+    }
+
+    #[test]
+    fn captured_token_imprints_the_root_it_claims() {
+        let (gen_time, imprint) = token_imprint(PROOF).unwrap();
+        assert_eq!(gen_time, "20261002193814Z");
+        let root: [u8; 32] = hex::decode(ROOT_HEX).unwrap().try_into().unwrap();
+        assert_eq!(imprint, sha256(&root));
+        assert_eq!(rfc3161_report(PROOF, ROOT_HEX).unwrap(), gen_time);
+    }
+
+    #[test]
+    fn token_timestamping_another_root_is_rejected() {
+        let err = rfc3161_report(PROOF, &hex::encode([0x11; 32])).unwrap_err();
+        assert!(err.contains("timestamps a different value"), "{err}");
+    }
+
+    #[test]
+    fn unreadable_proofs_are_rejected() {
+        assert!(token_imprint("not base64!").is_err());
+        assert!(token_imprint("AAAA").is_err());
+        assert!(token_imprint(&PROOF[..100]).is_err());
     }
 }

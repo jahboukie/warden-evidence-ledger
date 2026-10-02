@@ -317,6 +317,36 @@ fn print_timestamp(verified: &tsa::VerifiedTimestamp) {
     println!("  {:<13} {}", "tsa serial:", verified.serial_hex);
 }
 
+/// Re-verify one stored anchor's proof against the root hash it recorded,
+/// and return a one-line report for `warden info`.
+///
+/// This is the offline re-run of the checks `warden anchor` already applied
+/// when the proof was accepted: for an RFC 3161 token that is the full path
+/// in `tsa::verify_token` — messageImprint over *this* anchor's root, the
+/// CMS signed attributes, the signature, and the signer certificate's
+/// validity at `genTime`. (The request nonce is the one check that cannot
+/// be repeated: the request is gone by the time anyone re-reads the bundle.)
+fn anchor_proof_status(anchor: &Anchor) -> String {
+    let scope = format!("seq 0..={}", anchor.up_to_seq);
+    match anchor.anchor_type {
+        AnchorType::Rfc3161 => {
+            let checked = tsa::decode_token(&anchor.proof)
+                .context("proof is not base64")
+                .and_then(|token| tsa::verify_token(&token, &anchor.root_hash, None, None));
+            match checked {
+                Ok(v) => format!(
+                    "rfc3161 {scope} OK — genTime {}, policy {}, TSA {}",
+                    v.gen_time, v.policy, v.tsa_subject
+                ),
+                Err(e) => format!("rfc3161 {scope} FAILED — {e:#}"),
+            }
+        }
+        other => format!(
+            "{other:?} {scope} — proof stored; verify it against its external authority (not machine-checkable here)"
+        ),
+    }
+}
+
 fn cmd_info(dir: &Path) -> Result<()> {
     let manifest: Manifest = warden_core::read_manifest(dir)?;
     let entry_count = manifest.entries.len();
@@ -335,6 +365,13 @@ fn cmd_info(dir: &Path) -> Result<()> {
     match ledger.verify_chain() {
         Ok(()) => println!("chain integrity:  OK"),
         Err(e) => println!("chain integrity:  FAILED — {e}"),
+    }
+
+    if !manifest.anchors.is_empty() {
+        println!("anchor proofs:");
+        for anchor in &manifest.anchors {
+            println!("  - {}", anchor_proof_status(anchor));
+        }
     }
 
     for item in fs::read_dir(dir)? {
@@ -357,4 +394,46 @@ fn cmd_info(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Root hash the captured fixture token timestamps.
+    const ROOT_HEX: &str = "cfd7e9e720f040bf65c8799157309aae3c2e7491b4e3ce31bac001276eb6cb70";
+    const PROOF: &str = include_str!("../tests/fixtures/freetsa-proof.b64");
+
+    fn anchor(root_hash: [u8; 32], anchor_type: AnchorType) -> Anchor {
+        Anchor {
+            up_to_seq: 0,
+            root_hash,
+            anchor_type,
+            proof: PROOF.to_string(),
+            anchored_at_unix: 0,
+        }
+    }
+
+    #[test]
+    fn stored_rfc3161_proof_reverifies() {
+        let root: [u8; 32] = hex::decode(ROOT_HEX).unwrap().try_into().unwrap();
+        let status = anchor_proof_status(&anchor(root, AnchorType::Rfc3161));
+        assert!(status.contains("rfc3161 seq 0..=0 OK"), "{status}");
+        assert!(status.contains("2026-10-02T19:38:14Z"), "{status}");
+        assert!(status.contains("freetsa.org"), "{status}");
+    }
+
+    #[test]
+    fn stored_proof_for_a_different_root_fails() {
+        let status = anchor_proof_status(&anchor([0x11; 32], AnchorType::Rfc3161));
+        assert!(status.contains("rfc3161 seq 0..=0 FAILED"), "{status}");
+        assert!(status.contains("messageImprint"), "{status}");
+    }
+
+    #[test]
+    fn unverifiable_anchor_types_say_so() {
+        let status = anchor_proof_status(&anchor([0x11; 32], AnchorType::Manual));
+        assert!(status.contains("external authority"), "{status}");
+        assert!(status.contains("not machine-checkable"), "{status}");
+    }
 }
