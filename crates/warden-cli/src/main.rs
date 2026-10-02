@@ -350,6 +350,20 @@ fn anchor_proof_status(anchor: &Anchor) -> Result<String, String> {
     }
 }
 
+/// Does this 64-hex-char blob decode to the seed of the key that signed
+/// this ledger? If yes, it is *definitely* the regulator's private key —
+/// not merely something that looks like one.
+fn is_ledger_signing_key(file_text: &str, regulator_pubkey: &str) -> bool {
+    let Ok(seed_bytes) = hex::decode(file_text.trim()) else {
+        return false;
+    };
+    let Ok(seed) = <[u8; 32]>::try_from(seed_bytes) else {
+        return false;
+    };
+    let key = SigningKey::from_bytes(&seed);
+    hex::encode(key.verifying_key().to_bytes()).eq_ignore_ascii_case(regulator_pubkey)
+}
+
 fn cmd_info(dir: &Path) -> Result<()> {
     let manifest: Manifest = warden_core::read_manifest(dir)?;
     let entry_count = manifest.entries.len();
@@ -393,14 +407,22 @@ fn cmd_info(dir: &Path) -> Result<()> {
         if !item.file_type()?.is_file() {
             continue;
         }
-        let looks_like_key = fs::read_to_string(item.path())
-            .map(|t| {
-                let t = t.trim();
-                t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())
-            })
-            .unwrap_or(false);
-        if looks_like_key {
-            let name = item.file_name().to_string_lossy().into_owned();
+        let content = fs::read_to_string(item.path()).unwrap_or_default();
+        let trimmed = content.trim();
+        if !(trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit())) {
+            continue;
+        }
+
+        let name = item.file_name().to_string_lossy().into_owned();
+        if is_ledger_signing_key(trimmed, &manifest.regulator_pubkey) {
+            println!();
+            println!("ERROR: {name} IS this ledger's regulator signing key.");
+            println!("Anyone who receives this bundle can forge regulator signatures for it.");
+            println!("Move it out of the bundle directory before handing anything over.");
+            failures.push(format!(
+                "custody: {name} (this ledger's signing key) sits inside the bundle"
+            ));
+        } else {
             println!();
             println!("WARNING: {name} sits inside the bundle and looks like a private key.");
             println!("Hand over ONLY manifest.json + payloads/. Never share this file —");
@@ -458,5 +480,22 @@ mod tests {
         let status = anchor_proof_status(&anchor([0x11; 32], AnchorType::Manual)).unwrap();
         assert!(status.contains("external authority"), "{status}");
         assert!(status.contains("not machine-checkable"), "{status}");
+    }
+
+    #[test]
+    fn only_the_ledgers_own_seed_is_recognized_as_its_key() {
+        let pubkey = hex::encode(
+            SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let seed = hex::encode([7u8; 32]);
+
+        assert!(is_ledger_signing_key(&seed, &pubkey));
+        assert!(is_ledger_signing_key(&format!("  {seed}\n"), &pubkey));
+        // a different seed, a hash-shaped blob, and garbage: not the key
+        assert!(!is_ledger_signing_key(&hex::encode([8u8; 32]), &pubkey));
+        assert!(!is_ledger_signing_key(&hex::encode([0x11; 32]), &pubkey));
+        assert!(!is_ledger_signing_key("not hex at all", &pubkey));
     }
 }
