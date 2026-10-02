@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/warden-core",
+    "crates/warden-verify",
+    "crates/warden-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["17342926 Canada Inc."]
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -1,0 +1,20 @@
+[package]
+name = "warden-verify"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Deliberately minimal and NOT dependent on warden-core. The whole point
+# of this crate is that a skeptical third party can read it in an
+# afternoon without trusting anything else in this repository.
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+[[bin]]
+name = "warden-verify"
+path = "src/main.rs"

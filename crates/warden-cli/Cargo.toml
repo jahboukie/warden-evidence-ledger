@@ -1,0 +1,19 @@
+[package]
+name = "warden-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+warden-core = { path = "../warden-core" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+anyhow = "1"
+chrono = "0.4"
+
+[[bin]]
+name = "warden"
+path = "src/main.rs"
