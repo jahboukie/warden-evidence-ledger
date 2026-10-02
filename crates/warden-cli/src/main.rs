@@ -317,8 +317,7 @@ fn print_timestamp(verified: &tsa::VerifiedTimestamp) {
     println!("  {:<13} {}", "tsa serial:", verified.serial_hex);
 }
 
-/// Re-verify one stored anchor's proof against the root hash it recorded,
-/// and return a one-line report for `warden info`.
+/// Re-verify one stored anchor's proof against the root hash it recorded.
 ///
 /// This is the offline re-run of the checks `warden anchor` already applied
 /// when the proof was accepted: for an RFC 3161 token that is the full path
@@ -326,24 +325,28 @@ fn print_timestamp(verified: &tsa::VerifiedTimestamp) {
 /// CMS signed attributes, the signature, and the signer certificate's
 /// validity at `genTime`. (The request nonce is the one check that cannot
 /// be repeated: the request is gone by the time anyone re-reads the bundle.)
-fn anchor_proof_status(anchor: &Anchor) -> String {
+///
+/// Returns the one-line report, or `Err` with that same report when the
+/// proof does not check out — `warden info` exits non-zero on any `Err`.
+fn anchor_proof_status(anchor: &Anchor) -> Result<String, String> {
     let scope = format!("seq 0..={}", anchor.up_to_seq);
     match anchor.anchor_type {
         AnchorType::Rfc3161 => {
             let checked = tsa::decode_token(&anchor.proof)
                 .context("proof is not base64")
                 .and_then(|token| tsa::verify_token(&token, &anchor.root_hash, None, None));
-            match checked {
-                Ok(v) => format!(
-                    "rfc3161 {scope} OK — genTime {}, policy {}, TSA {}",
-                    v.gen_time, v.policy, v.tsa_subject
-                ),
-                Err(e) => format!("rfc3161 {scope} FAILED — {e:#}"),
-            }
+            checked
+                .map(|v| {
+                    format!(
+                        "rfc3161 {scope} OK — genTime {}, policy {}, TSA {}",
+                        v.gen_time, v.policy, v.tsa_subject
+                    )
+                })
+                .map_err(|e| format!("rfc3161 {scope} FAILED — {e:#}"))
         }
-        other => format!(
+        other => Ok(format!(
             "{other:?} {scope} — proof stored; verify it against its external authority (not machine-checkable here)"
-        ),
+        )),
     }
 }
 
@@ -362,15 +365,26 @@ fn cmd_info(dir: &Path) -> Result<()> {
         None => println!("current root:     (empty ledger)"),
     }
 
+    let mut failures: Vec<String> = Vec::new();
+
     match ledger.verify_chain() {
         Ok(()) => println!("chain integrity:  OK"),
-        Err(e) => println!("chain integrity:  FAILED — {e}"),
+        Err(e) => {
+            println!("chain integrity:  FAILED — {e}");
+            failures.push(format!("chain integrity: {e}"));
+        }
     }
 
     if !manifest.anchors.is_empty() {
         println!("anchor proofs:");
         for anchor in &manifest.anchors {
-            println!("  - {}", anchor_proof_status(anchor));
+            match anchor_proof_status(anchor) {
+                Ok(report) => println!("  - {report}"),
+                Err(report) => {
+                    println!("  - {report}");
+                    failures.push(report);
+                }
+            }
         }
     }
 
@@ -393,7 +407,16 @@ fn cmd_info(dir: &Path) -> Result<()> {
             println!("whoever holds it can forge regulator signatures for this ledger.");
         }
     }
-    Ok(())
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "ledger did not verify — {} problem(s): {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -417,7 +440,7 @@ mod tests {
     #[test]
     fn stored_rfc3161_proof_reverifies() {
         let root: [u8; 32] = hex::decode(ROOT_HEX).unwrap().try_into().unwrap();
-        let status = anchor_proof_status(&anchor(root, AnchorType::Rfc3161));
+        let status = anchor_proof_status(&anchor(root, AnchorType::Rfc3161)).unwrap();
         assert!(status.contains("rfc3161 seq 0..=0 OK"), "{status}");
         assert!(status.contains("2026-10-02T19:38:14Z"), "{status}");
         assert!(status.contains("freetsa.org"), "{status}");
@@ -425,14 +448,14 @@ mod tests {
 
     #[test]
     fn stored_proof_for_a_different_root_fails() {
-        let status = anchor_proof_status(&anchor([0x11; 32], AnchorType::Rfc3161));
+        let status = anchor_proof_status(&anchor([0x11; 32], AnchorType::Rfc3161)).unwrap_err();
         assert!(status.contains("rfc3161 seq 0..=0 FAILED"), "{status}");
         assert!(status.contains("messageImprint"), "{status}");
     }
 
     #[test]
     fn unverifiable_anchor_types_say_so() {
-        let status = anchor_proof_status(&anchor([0x11; 32], AnchorType::Manual));
+        let status = anchor_proof_status(&anchor([0x11; 32], AnchorType::Manual)).unwrap();
         assert!(status.contains("external authority"), "{status}");
         assert!(status.contains("not machine-checkable"), "{status}");
     }
